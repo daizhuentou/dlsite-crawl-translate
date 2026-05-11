@@ -16,35 +16,35 @@ from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
 
-BASE_DIR = Path(__file__).parent
-WORKS_DIR = BASE_DIR / "works"
-ORDER_FILE = BASE_DIR / "works_order.json"
-CRAWL_RESULTS_FILE = BASE_DIR / "crawl_results.json"
-OUTPUT_DIR = BASE_DIR / "output"
-IMAGES_DIR = OUTPUT_DIR / "images"
-DATA_DIR = OUTPUT_DIR / "data"
-JSON_DIR = DATA_DIR / "json"
-TRANSLATE_DIR = DATA_DIR / "translate"
-PENDING_TRANSLATE_DIR = BASE_DIR / "待翻译"
-DONE_TRANSLATE_DIR = TRANSLATE_DIR / "已翻译"
-TRANSLATED_DRAFT_DIR = BASE_DIR / "翻译稿"
-ORIG_DIR = DATA_DIR / "orig"
-CATEGORIES_FILE = DATA_DIR / "categories.json"
-SEARCH_INDEX_FILE = DATA_DIR / "search_index.json"
-FILTER_INDEX_DIR = DATA_DIR / "filter_index"
-ASMR_SUBTITLE_CACHE_FILE = BASE_DIR / "asmr_subtitle_cache.json"
-SLIDER_IMAGES_DIR = IMAGES_DIR / "slider"
-PARTS_IMAGES_DIR = IMAGES_DIR / "parts"
+BASE_DIR = Path(__file__).parent  # 项目根目录
+WORKS_DIR = BASE_DIR / "works"  # 作品HTML文件存储目录
+ORDER_FILE = BASE_DIR / "works_order.json"  # 作品人气排序文件
+CRAWL_RESULTS_FILE = BASE_DIR / "crawl_results.json"  # 爬取的分类和作品关系文件
+OUTPUT_DIR = BASE_DIR / "output"  # 输出目录
+IMAGES_DIR = OUTPUT_DIR / "images"  # 图片存储目录
+DATA_DIR = OUTPUT_DIR / "data"  # 数据文件目录
+JSON_DIR = DATA_DIR / "json"  # 作品JSON数据目录
+TRANSLATE_DIR = DATA_DIR / "translate"  # 翻译相关数据目录
+PENDING_TRANSLATE_DIR = BASE_DIR / "待翻译"  # 待翻译稿目录
+DONE_TRANSLATE_DIR = TRANSLATE_DIR / "已翻译"  # 已归档的待翻译原稿目录
+TRANSLATED_DRAFT_DIR = BASE_DIR / "翻译稿"  # 翻译好的稿件目录
+ORIG_DIR = DATA_DIR / "orig"  # 原文对照文件目录
+CATEGORIES_FILE = DATA_DIR / "categories.json"  # 分类配置文件
+SEARCH_INDEX_FILE = DATA_DIR / "search_index.json"  # 搜索索引文件
+FILTER_INDEX_DIR = DATA_DIR / "filter_index"  # 筛选索引目录
+ASMR_SUBTITLE_CACHE_FILE = BASE_DIR / "asmr_subtitle_cache.json"  # ASMR字幕缓存文件
+SLIDER_IMAGES_DIR = IMAGES_DIR / "slider"  # 轮播图存储目录
+PARTS_IMAGES_DIR = IMAGES_DIR / "parts"  # 内容图存储目录
 MAX_CONCURRENT_IMAGES = 300  # 最大并发下载图片数量
-MAX_PARSE_WORKERS = min(12, max(4, (os.cpu_count() or 4)))
-PARSE_PROGRESS_INTERVAL = 500
-PAGE_WRITE_LOG_INTERVAL = 100
-IMAGE_SCAN_PROGRESS_INTERVAL = 1000
-IMAGE_INDEX_PROGRESS_INTERVAL = 20000
-ASMR_SUBTITLE_REFRESH = "--refresh-asmr-subtitles" in sys.argv
-ASMR_SUBTITLE_CONCURRENCY = 2
-ASMR_SUBTITLE_MAX_RETRIES = 8
-ASMR_SUBTITLE_RETRY_DELAY = 3
+MAX_PARSE_WORKERS = max(12, max(4, (os.cpu_count() or 4)))  # HTML解析线程池大小
+PARSE_PROGRESS_INTERVAL = 500  # 解析HTML进度显示间隔（每处理多少个作品显示一次）
+PAGE_WRITE_LOG_INTERVAL = 100  # 分页JSON写入日志间隔（每写入多少个分页显示一次）
+IMAGE_SCAN_PROGRESS_INTERVAL = 1000  # 扫描作品图片进度显示间隔
+IMAGE_INDEX_PROGRESS_INTERVAL = 20000  # 图片索引进度显示间隔
+ASMR_SUBTITLE_REFRESH = "--refresh-asmr-subtitles" in sys.argv  # 是否刷新ASMR字幕类型
+ASMR_SUBTITLE_CONCURRENCY = 2  # ASMR字幕查询并发数
+ASMR_SUBTITLE_MAX_RETRIES = 8  # ASMR字幕查询最大重试次数
+ASMR_SUBTITLE_RETRY_DELAY = 3  # ASMR字幕查询重试间隔（秒）
 ASMR_SUBTITLE_API_TEMPLATE = (
     "https://api.asmr-200.com/api/search/{work_id}"
     "?order=create_date&sort=desc&page=1&pageSize=20"
