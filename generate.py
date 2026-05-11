@@ -1125,6 +1125,48 @@ def find_work_html_files():
     return sorted(html_files)
 
 
+def get_work_version_ids(work):
+    work_ids = [work["product_id"]]
+    work_ids.extend(work.get("version_ids") or [])
+    return unique_values([work_id.upper() for work_id in work_ids if work_id])
+
+
+def choose_preferred_version_work(group_works):
+    return min(
+        enumerate(group_works),
+        key=lambda item: (item[1].get("version_rank", 2), item[0]),
+    )[1]
+
+
+def collect_version_groups(works):
+    groups = []
+    groups_by_id = {}
+    for work in works:
+        group_id = work.get("version_group_id") or work["product_id"]
+        if group_id not in groups_by_id:
+            groups_by_id[group_id] = []
+            groups.append(groups_by_id[group_id])
+        groups_by_id[group_id].append(work)
+    return groups
+
+
+def has_any_translation_file(work_ids):
+    for work_id in work_ids:
+        translated_paths = [
+            TRANSLATED_DRAFT_DIR / f"{work_id}.zh.md",
+            TRANSLATE_DIR / f"{work_id}.zh.md",
+            DONE_TRANSLATE_DIR / f"{work_id}.zh.md",
+            PENDING_TRANSLATE_DIR / f"{work_id}.zh.md",
+        ]
+        if any(path.exists() for path in translated_paths):
+            return True
+    return False
+
+
+def has_any_pending_translate_file(work_ids):
+    return any((PENDING_TRANSLATE_DIR / f"{work_id}.md").exists() for work_id in work_ids)
+
+
 def write_work_markdown_files(works):
     TRANSLATE_DIR.mkdir(parents=True, exist_ok=True)
     PENDING_TRANSLATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1136,34 +1178,40 @@ def write_work_markdown_files(works):
     written = 0
     skipped_translated = 0
     skipped_pending = 0
-    for work in works:
+    skipped_duplicate_versions = 0
+    for group_works in collect_version_groups(works):
+        work = choose_preferred_version_work(group_works)
         work_id = work["product_id"]
         if work_id in seen:
             continue
         seen.add(work_id)
 
-        translated_paths = [
-            TRANSLATED_DRAFT_DIR / f"{work_id}.zh.md",
-            TRANSLATE_DIR / f"{work_id}.zh.md",
-            PENDING_TRANSLATE_DIR / f"{work_id}.zh.md",
-        ]
+        group_work_ids = []
+        for group_work in group_works:
+            group_work_ids.extend(get_work_version_ids(group_work))
+        group_work_ids = unique_values(group_work_ids)
         pending_path = PENDING_TRANSLATE_DIR / f"{work_id}.md"
 
-        if any(path.exists() for path in translated_paths):
+        if has_any_translation_file(group_work_ids):
             skipped_translated += 1
-        elif pending_path.exists():
+        elif has_any_pending_translate_file(group_work_ids):
             skipped_pending += 1
         else:
             with open(pending_path, "w", encoding="utf-8") as f:
                 f.write(generate_translate_md([work]))
             written += 1
 
+        skipped_duplicate_versions += max(0, len(group_works) - 1)
+
+    for work in works:
+        work_id = work["product_id"]
         orig_path = ORIG_DIR / f"{work_id}.md"
         with open(orig_path, "w", encoding="utf-8") as f:
             f.write(generate_orig_md([work]))
 
     print(f"\n已生成 {written} 个待翻译作品文件 -> {PENDING_TRANSLATE_DIR}")
     print(f"已跳过 {skipped_translated} 个已有译文、{skipped_pending} 个已有待翻译稿")
+    print(f"多版本作品已按组去重，避免重复生成 {skipped_duplicate_versions} 个待翻译稿")
     print(f"原文对照文件已生成 -> {ORIG_DIR}")
 
 

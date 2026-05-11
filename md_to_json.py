@@ -210,6 +210,73 @@ def load_translations():
     return translations, sources, files
 
 
+def get_version_rank(work):
+    try:
+        return int(work.get("version_rank", 2))
+    except (TypeError, ValueError):
+        return 2
+
+
+def build_translation_reuse_map(json_files, translations):
+    work_groups = {}
+    work_ranks = {}
+    group_candidates = {}
+
+    for json_path in json_files:
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                json_data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        if not isinstance(json_data, list):
+            continue
+
+        for work in json_data:
+            if not isinstance(work, dict):
+                continue
+
+            work_id = work.get("product_id")
+            if not work_id:
+                continue
+
+            group_id = work.get("version_group_id") or work_id
+            rank = get_version_rank(work)
+            work_groups[work_id] = group_id
+            work_ranks[work_id] = rank
+
+            for version_id in work.get("version_ids", []) or []:
+                if not isinstance(version_id, str) or not version_id:
+                    continue
+                work_groups.setdefault(version_id, group_id)
+                work_ranks.setdefault(version_id, 2)
+
+    for work_id, trans in translations.items():
+        group_id = work_groups.get(work_id, work_id)
+        rank = work_ranks.get(work_id, 2)
+        current = group_candidates.get(group_id)
+        candidate = {
+            "rank": rank,
+            "work_id": work_id,
+            "translation": trans,
+        }
+        if current is None or (rank, work_id) < (current["rank"], current["work_id"]):
+            group_candidates[group_id] = candidate
+
+    reused_translations = dict(translations)
+    reused_count = 0
+    for work_id, group_id in work_groups.items():
+        if work_id in reused_translations:
+            continue
+        candidate = group_candidates.get(group_id)
+        if not candidate:
+            continue
+        reused_translations[work_id] = candidate["translation"]
+        reused_count += 1
+
+    return reused_translations, reused_count
+
+
 def apply_translations_to_json(json_data, translations):
     translated_count = 0
     applied_work_ids = set()
@@ -302,6 +369,10 @@ def main():
         return
 
     json_files = sorted(JSON_DIR.rglob("page_*.json"))
+    translations_for_apply, reused_count = build_translation_reuse_map(json_files, translations)
+    if reused_count:
+        print(f"多版本译文复用: 已为 {reused_count} 个同组版本复用现有译文。")
+
     total_pages = 0
     total_works = 0
     total_translated = 0
@@ -311,7 +382,7 @@ def main():
         with open(json_path, "r", encoding="utf-8") as f:
             json_data = json.load(f)
 
-        json_data, translated_count, page_applied_ids = apply_translations_to_json(json_data, translations)
+        json_data, translated_count, page_applied_ids = apply_translations_to_json(json_data, translations_for_apply)
         applied_work_ids.update(page_applied_ids)
 
         with open(json_path, "w", encoding="utf-8") as f:
@@ -327,7 +398,7 @@ def main():
 
     print(
         f"\n导入完成：读取 {len(md_files)} 个翻译文件，"
-        f"解析 {len(translations)} 个作品；更新 {total_pages} 个 JSON 页，"
+        f"解析 {len(translations)} 个作品，复用到 {reused_count} 个同组版本；更新 {total_pages} 个 JSON 页，"
         f"{total_translated}/{total_works} 个展示条目命中翻译。"
     )
     print(f"已归档 {moved_pending} 个待翻译稿到 {DONE_TRANSLATE_DIR}。")
