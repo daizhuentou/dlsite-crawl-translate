@@ -395,6 +395,11 @@ python md_to_json.py
 - 2026-05-11：继续优化 `generate.py` 的图片路径整理阶段。多版本同图复用从“每张图执行一次目录 glob”改为“启动时一次性建立图片 hash 索引”，并新增图片索引与 `扫描作品图片` 进度输出，修复 ASMR 字幕类型处理完成后静默很久的问题。
 - 2026-05-11：待翻译稿和译文导入支持多版本复用。`generate.py` 生成待翻译 Markdown 时按 `version_group_id` 去重，同组只生成一个稿；`md_to_json.py` 导入译文时会把同组任意 RJ 的译文复用到其他版本。
 - 2026-05-12：扩展多版本识别到平台版本。`generate.py` 会从 `work_edition` 里的 `PC版 / Android版` 等链接建立版本组，`version_rank` 改成“语言优先级 + 平台优先级”的组合排序，因此同作品默认展示 PC 版而不是 Android 版。
+- 2026-05-12：分类筛选器改成可搜索的自定义下拉。网页顶部“分类”现在点击后才展开面板，面板内提供实时搜索框过滤分类项，并支持点击空白处或按 `Esc` 关闭；这样默认界面更干净，同时分类很多时也更容易定位。
+- 2026-05-12：全局搜索和分类搜索支持中文拼音与拼音首字母。`generate.py` 在生成 `categories.json` 和 `search_index.json` 时会为中文名称预计算拼音别名，例如 `人妻 -> ren / rq`；全局搜索还把作品所属分类名一并写入索引，因此既可以用中文搜分类词，也可以直接用拼音或首字母搜到对应作品。
+- 2026-05-12：用 DLsite `genre` 页的简体中文标题回填官方分类名。`list.devtools` 已把 `マッサージ / 添い寝 / スワッピング / ダウナー / 淫紋 / 寝取` 等日文 genre 文案替换成中文；`crawler.py` 现在对带 `genre[0]` 的 URL 优先使用 `list.devtools` 映射；`generate.py` 读取现有 `crawl_results.json` 时也会按同一映射规范化分类名并刷新 slug，因此重新生成后 `output/data/categories.json` 和网页分类会同步变成中文。
+- 2026-05-12：同一 `genre[0]` 的重复分类现在会自动合并。`crawler.py` 读取/写入 `crawl_results.json` 时会按 `genre id` 作为主键合并重复项、去重 `work_ids` 并规范化 slug；`generate.py` 读取分类时也会再次按 `genre id` 合并，避免历史脏数据导致网页里出现 `分类名_2`。本次已把 `NTR(黄毛视角)_2`、`婊子_2` 等重复分类清理掉。
+- 2026-05-12：`crawler.py` 现在支持“多 URL 并发爬取”。单个分类内部原本就会异步并发下载作品页；这次新增了“多个分类 URL 同时处理”的队列并发配置，交互模式会提示“同时并发处理几个链接”，CLI 也支持 `--url-concurrency` / `--queue-concurrency`。总连接数会按链接并发数自动放大到上限 `MAX_TOTAL_CONCURRENT`。同时新增 `DownloadCoordinator`，避免多个并发分类因为作品重叠而把同一个 RJ/VJ 重复下载两次。
 
 ## GUI 应用 (`gui/`)
 
@@ -435,3 +440,8 @@ python gui/main.py
 ```powershell
 pip install PyQt5 aiohttp
 ```
+
+### 2026-05-12 补充
+
+- `crawler.py` 的“只下载有字幕音声 ASMR”新增了字幕缓存来源开关。交互模式会再问一次“是否只使用本地 `asmr_subtitle_cache.json`”，默认 `Y`；CLI 可用 `--subtitle-cache-only` / `--local-subtitle-cache-only` 强制只查本地缓存，也可用 `--subtitle-refresh-missing` / `--subtitle-query-missing` / `--subtitle-api-missing` 在缓存缺失时回源 asmr-200 API。默认策略已经改成“仅本地缓存”，缺失项会跳过而不是直接联网查询。
+- `update_asmr_subtitles.py` 新增“3. 同步官方有字幕作品目录”模式。它会用 `https://api.asmr-200.com/api/works?...&subtitle=1` 以固定 3 页并发抓取官方字幕目录，把命中的 RJ/VJ 及其语言版本写回 `asmr_subtitle_cache.json`，并在缓存里记录 `works_api_item_id` / `works_api_synced_at` 等标记。后续再次运行时，脚本会在按时间倒序扫描时一旦遇到上次已同步过的目录作品就停止，只补新出现的字幕作品；429 仍会按现有退避逻辑自动重试。

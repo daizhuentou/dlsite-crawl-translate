@@ -1,6 +1,7 @@
 import asyncio
 import sys
 import time
+from datetime import datetime
 
 import aiohttp
 
@@ -21,6 +22,14 @@ from generate import (
 
 
 DEFAULT_CONCURRENCY = 3
+OFFICIAL_SUBTITLED_WORKS_CONCURRENCY = 3
+OFFICIAL_SUBTITLED_WORKS_PAGE_SIZE = 20
+OFFICIAL_SUBTITLED_WORKS_API_TEMPLATE = (
+    "https://api.asmr-200.com/api/works"
+    "?order=create_date&sort=desc&page={page}&pageSize={page_size}&subtitle=1"
+)
+OFFICIAL_SUBTITLED_WORKS_ITEM_ID_KEY = "works_api_item_id"
+OFFICIAL_SUBTITLED_WORKS_SYNCED_AT_KEY = "works_api_synced_at"
 AUTO_CONCURRENCY = "auto"
 AUTO_MIN_CONCURRENCY = 1
 AUTO_MAX_CONCURRENCY = 8
@@ -101,14 +110,15 @@ def prompt_choice():
     print("请选择要执行的功能：")
     print("  1. 补查未确认的音声 ASMR")
     print("  2. 复查已标为无字幕的音声 ASMR")
+    print("  3. 同步官方有字幕作品目录")
     while True:
-        value = read_input("输入 1 或 2: ").strip()
-        if value in ("1", "2"):
+        value = read_input("输入 1、2 或 3: ").strip()
+        if value in ("1", "2", "3"):
             return value
         if not value:
             print("未选择功能，已取消。")
             return ""
-        print("输入无效，请输入 1 或 2。")
+        print("输入无效，请输入 1、2 或 3。")
 
 
 def prompt_int(label, default, minimum=1, allow_auto=False):
@@ -136,6 +146,129 @@ def get_retry_wait_seconds(retry_after, attempt):
     except ValueError:
         value = fallback
     return max(RATE_LIMIT_MIN_WAIT, value)
+
+
+def build_official_subtitled_works_url(page, page_size=OFFICIAL_SUBTITLED_WORKS_PAGE_SIZE):
+    return OFFICIAL_SUBTITLED_WORKS_API_TEMPLATE.format(page=page, page_size=page_size)
+
+
+def normalize_work_id(value):
+    if not isinstance(value, str):
+        return ""
+    work_id = value.strip().upper()
+    if len(work_id) < 3:
+        return ""
+    if not (work_id.startswith("RJ") or work_id.startswith("VJ")):
+        return ""
+    if not work_id[2:].isdigit():
+        return ""
+    return work_id
+
+
+def extract_catalog_related_work_ids(work):
+    work_ids = []
+    seen = set()
+
+    def add_work_id(value):
+        work_id = normalize_work_id(value)
+        if not work_id or work_id in seen:
+            return
+        seen.add(work_id)
+        work_ids.append(work_id)
+
+    add_work_id(work.get("source_id"))
+    add_work_id(work.get("original_workno"))
+
+    translation_info = work.get("translation_info")
+    if isinstance(translation_info, dict):
+        add_work_id(translation_info.get("parent_workno"))
+        add_work_id(translation_info.get("original_workno"))
+        for child_workno in translation_info.get("child_worknos", []):
+            add_work_id(child_workno)
+
+    for edition in work.get("language_editions", []):
+        if isinstance(edition, dict):
+            add_work_id(edition.get("workno"))
+            add_work_id(edition.get("source_id"))
+
+    for edition in work.get("other_language_editions_in_db", []):
+        if isinstance(edition, dict):
+            add_work_id(edition.get("workno"))
+            add_work_id(edition.get("source_id"))
+
+    return work_ids
+
+
+def get_catalog_primary_work_id(work):
+    primary_work_id = normalize_work_id(work.get("source_id"))
+    if primary_work_id:
+        return primary_work_id
+
+    related_ids = extract_catalog_related_work_ids(work)
+    return related_ids[0] if related_ids else ""
+
+
+def is_catalog_work_already_synced(cache, work):
+    primary_work_id = get_catalog_primary_work_id(work)
+    if not primary_work_id:
+        return False
+
+    entry = cache.get(primary_work_id)
+    if not isinstance(entry, dict):
+        return False
+
+    current_item_id = work.get("id")
+    if current_item_id is None:
+        return False
+
+    return str(entry.get(OFFICIAL_SUBTITLED_WORKS_ITEM_ID_KEY, "")) == str(current_item_id)
+
+
+def mark_catalog_work_as_subtitled(cache, work):
+    checked_at = datetime.now().isoformat(timespec="seconds")
+    primary_work_id = get_catalog_primary_work_id(work)
+    related_work_ids = extract_catalog_related_work_ids(work)
+    if primary_work_id and primary_work_id not in related_work_ids:
+        related_work_ids.insert(0, primary_work_id)
+
+    cache_writes = 0
+    new_cache_entries = 0
+    item_id = str(work.get("id", ""))
+    source_url = work.get("source_url") if isinstance(work.get("source_url"), str) else ""
+    create_date = work.get("create_date") if isinstance(work.get("create_date"), str) else ""
+
+    for work_id in related_work_ids:
+        existing_entry = cache.get(work_id)
+        if isinstance(existing_entry, dict):
+            entry = dict(existing_entry)
+        else:
+            entry = {}
+            new_cache_entries += 1
+
+        before = dict(entry)
+        entry["has_subtitle"] = True
+        entry["status"] = "ok"
+        entry["checked_at"] = checked_at
+        entry[OFFICIAL_SUBTITLED_WORKS_SYNCED_AT_KEY] = checked_at
+        if create_date:
+            entry["works_api_create_date"] = create_date
+        if work_id == primary_work_id and item_id:
+            entry[OFFICIAL_SUBTITLED_WORKS_ITEM_ID_KEY] = item_id
+        if work_id == primary_work_id and source_url:
+            entry["works_api_source_url"] = source_url
+
+        if entry != before:
+            cache[work_id] = entry
+            cache_writes += 1
+        elif work_id not in cache:
+            cache[work_id] = entry
+
+    return {
+        "primary_work_id": primary_work_id,
+        "related_work_ids": related_work_ids,
+        "new_cache_entries": new_cache_entries,
+        "cache_writes": cache_writes,
+    }
 
 
 def collect_audio_asmr_ids():
@@ -188,6 +321,45 @@ async def query_subtitle_api(session, work_id, log=print, on_rate_limit=None):
                 await asyncio.sleep(wait_seconds)
                 continue
             log(f"  字幕 API 查询失败: {work_id} - {e}")
+            return None, saw_rate_limit
+
+    return None, saw_rate_limit
+
+
+async def fetch_official_subtitled_works_page(session, page, log=print, on_rate_limit=None):
+    url = build_official_subtitled_works_url(page)
+    saw_rate_limit = False
+    notified_rate_limit = False
+    for attempt in range(1, ASMR_SUBTITLE_MAX_RETRIES + 1):
+        try:
+            async with session.get(url, timeout=20) as resp:
+                if resp.status == 429 and attempt < ASMR_SUBTITLE_MAX_RETRIES:
+                    saw_rate_limit = True
+                    if on_rate_limit and not notified_rate_limit:
+                        on_rate_limit()
+                        notified_rate_limit = True
+                    wait_seconds = get_retry_wait_seconds(resp.headers.get("Retry-After"), attempt)
+                    log(f"  官方字幕目录 API 限流: 第 {page} 页，{wait_seconds:.1f} 秒后重试")
+                    await asyncio.sleep(wait_seconds)
+                    continue
+
+                if resp.status != 200:
+                    log(f"  官方字幕目录 API 状态异常: 第 {page} 页 HTTP {resp.status}")
+                    return None, saw_rate_limit
+
+                data = await resp.json(content_type=None)
+                works = data.get("works")
+                if not isinstance(works, list):
+                    log(f"  官方字幕目录 API 返回异常: 第 {page} 页缺少 works 列表")
+                    return None, saw_rate_limit
+                return works, saw_rate_limit
+        except Exception as e:
+            if attempt < ASMR_SUBTITLE_MAX_RETRIES:
+                wait_seconds = ASMR_SUBTITLE_RETRY_DELAY * attempt
+                log(f"  官方字幕目录 API 查询失败: 第 {page} 页 - {e}，{wait_seconds:.1f} 秒后重试")
+                await asyncio.sleep(wait_seconds)
+                continue
+            log(f"  官方字幕目录 API 查询失败: 第 {page} 页 - {e}")
             return None, saw_rate_limit
 
     return None, saw_rate_limit
@@ -309,6 +481,110 @@ async def update_targets(target_ids, label, concurrency):
     }
 
 
+async def sync_official_subtitled_works():
+    cache = load_asmr_subtitle_cache()
+    started_at = time.time()
+    page = 1
+    pages_fetched = 0
+    works_seen = 0
+    new_primary_works = 0
+    new_cache_entries = 0
+    cache_writes = 0
+    skipped_without_work_id = 0
+    rate_limited = 0
+    failed_pages = 0
+    stop_reason = ""
+
+    def log_message(message):
+        print(message, flush=True)
+
+    def note_rate_limit():
+        nonlocal rate_limited
+        rate_limited += 1
+
+    async with aiohttp.ClientSession(headers=HEADERS) as session:
+        while True:
+            page_batch = list(range(page, page + OFFICIAL_SUBTITLED_WORKS_CONCURRENCY))
+            results = await asyncio.gather(
+                *(
+                    fetch_official_subtitled_works_page(
+                        session,
+                        page_number,
+                        log=log_message,
+                        on_rate_limit=note_rate_limit,
+                    )
+                    for page_number in page_batch
+                )
+            )
+
+            reached_end = False
+
+            for page_number, (works, _saw_rate_limit) in zip(page_batch, results):
+                if works is None:
+                    failed_pages += 1
+                    stop_reason = f"第 {page_number} 页连续重试后仍失败"
+                    reached_end = True
+                    break
+
+                if not works:
+                    stop_reason = f"第 {page_number} 页开始没有更多作品"
+                    reached_end = True
+                    break
+
+                pages_fetched += 1
+
+                for work in works:
+                    primary_work_id = get_catalog_primary_work_id(work)
+                    if not primary_work_id:
+                        skipped_without_work_id += 1
+                        continue
+
+                    if is_catalog_work_already_synced(cache, work):
+                        stop_reason = f"第 {page_number} 页遇到已同步作品 {primary_work_id}"
+                        reached_end = True
+                        break
+
+                    works_seen += 1
+                    update_result = mark_catalog_work_as_subtitled(cache, work)
+                    new_primary_works += 1
+                    new_cache_entries += update_result["new_cache_entries"]
+                    cache_writes += update_result["cache_writes"]
+
+                if pages_fetched % 5 == 0:
+                    save_asmr_subtitle_cache(cache)
+
+                print(
+                    f"同步官方有字幕目录: 第 {page_number} 页 "
+                    f"(新作品 {new_primary_works}, 新缓存项 {new_cache_entries}, "
+                    f"写入 {cache_writes}, 429 {rate_limited})",
+                    flush=True,
+                )
+
+                if reached_end:
+                    break
+
+            if reached_end:
+                break
+
+            page += OFFICIAL_SUBTITLED_WORKS_CONCURRENCY
+
+    save_asmr_subtitle_cache(cache)
+    elapsed = time.time() - started_at
+    return {
+        "pages_fetched": pages_fetched,
+        "works_seen": works_seen,
+        "new_primary_works": new_primary_works,
+        "new_cache_entries": new_cache_entries,
+        "cache_writes": cache_writes,
+        "skipped_without_work_id": skipped_without_work_id,
+        "rate_limited": rate_limited,
+        "failed_pages": failed_pages,
+        "elapsed": elapsed,
+        "speed": works_seen / elapsed if elapsed > 0 else 0,
+        "stop_reason": stop_reason,
+    }
+
+
 async def main():
     choice = prompt_choice()
     if not choice:
@@ -336,6 +612,72 @@ async def main():
         return 0
 
 
+
+    summary = await update_targets(
+        target_ids,
+        label,
+        concurrency,
+    )
+    print("\n总结：")
+    print(f"  - 执行功能: {label}")
+    print(f"  - 本次处理: {summary['processed']} / {len(target_ids)}")
+    print(f"  - 更新为有字幕: {summary['subtitled']}")
+    print(f"  - 确认为无字幕: {summary['unsubtitled']}")
+    print(f"  - 查询失败/仍被限流: {summary['failed']}")
+    print(f"  - 遇到 429 限流: {summary['rate_limited']}")
+    if summary["auto_mode"]:
+        print(f"  - 自动并发最终值: {summary['final_concurrency']}")
+    print(f"  - 耗时: {format_duration(summary['elapsed'])}")
+    print(f"  - 平均速度: {summary['speed']:.2f} 个/秒")
+    print("下一步运行 python generate.py 重新生成网页，作品类型会根据缓存更新。")
+    return 0
+
+
+async def main():
+    choice = prompt_choice()
+    if not choice:
+        return 0
+
+    if choice == "3":
+        summary = await sync_official_subtitled_works()
+        print("\n总结：")
+        print("  - 执行功能: 同步官方有字幕作品目录")
+        print(f"  - 并发页数: {OFFICIAL_SUBTITLED_WORKS_CONCURRENCY}")
+        print(f"  - 抓取页数: {summary['pages_fetched']}")
+        print(f"  - 新同步作品: {summary['new_primary_works']}")
+        print(f"  - 新增缓存项: {summary['new_cache_entries']}")
+        print(f"  - 缓存写入次数: {summary['cache_writes']}")
+        print(f"  - 缺少可用 RJ/VJ 的条目: {summary['skipped_without_work_id']}")
+        print(f"  - 遇到 429 限流: {summary['rate_limited']}")
+        print(f"  - 失败页数: {summary['failed_pages']}")
+        if summary["stop_reason"]:
+            print(f"  - 停止原因: {summary['stop_reason']}")
+        print(f"  - 耗时: {format_duration(summary['elapsed'])}")
+        print(f"  - 平均同步速度: {summary['speed']:.2f} 个作品/秒")
+        print("下一步运行 python generate.py，网页里的 ASMR 字幕类型会按最新缓存刷新。")
+        return 0
+
+    concurrency = prompt_int("并发查询数", DEFAULT_CONCURRENCY, allow_auto=True)
+    limit = prompt_int("最多处理多少个作品？0=全部", 0, minimum=0)
+
+    cache = load_asmr_subtitle_cache()
+    audio_ids = collect_audio_asmr_ids()
+    print(f"本地音声 ASMR: {len(audio_ids)} 个")
+
+    if choice == "1":
+        target_ids = [work_id for work_id in audio_ids if get_cached_asmr_subtitle(cache, work_id) is None]
+        label = "补查未确认"
+    else:
+        target_ids = [work_id for work_id in audio_ids if get_cached_asmr_subtitle(cache, work_id) is False]
+        label = "复查无字幕"
+
+    if limit > 0:
+        target_ids = target_ids[:limit]
+
+    print(f"{label}目标: {len(target_ids)} 个")
+    if not target_ids:
+        print("没有需要处理的作品。")
+        return 0
 
     summary = await update_targets(
         target_ids,

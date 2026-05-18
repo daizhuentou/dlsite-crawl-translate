@@ -18,6 +18,9 @@ GENRE_LIST_FILE = BASE_DIR / "list.devtools"
 URL_HISTORY_FILE = BASE_DIR / "url_history.json"
 ASMR_SUBTITLE_CACHE_FILE = BASE_DIR / "asmr_subtitle_cache.json"
 MAX_CONCURRENT = 100
+MAX_TOTAL_CONCURRENT = 200
+DEFAULT_URL_QUEUE_CONCURRENCY = 10
+MAX_URL_QUEUE_CONCURRENCY = 10
 MAX_PAGES = 0  # 0 表示不限制；大于 0 表示本次最多爬取多少个搜索结果页
 MAX_WORK_RETRIES = 3
 WORK_RETRY_DELAY = 0
@@ -27,6 +30,19 @@ ASMR_SUBTITLE_FILTER_FLAGS = {
     "--subtitle-asmr-only",
     "--only-subtitle-asmr",
     "--asmr-subtitle-only",
+}
+ASMR_SUBTITLE_CACHE_ONLY_FLAGS = {
+    "--subtitle-cache-only",
+    "--local-subtitle-cache-only",
+}
+ASMR_SUBTITLE_REFRESH_FLAGS = {
+    "--subtitle-refresh-missing",
+    "--subtitle-query-missing",
+    "--subtitle-api-missing",
+}
+URL_QUEUE_CONCURRENCY_FLAGS = {
+    "--url-concurrency",
+    "--queue-concurrency",
 }
 ASMR_SUBTITLE_API_TEMPLATE = (
     "https://api.asmr-200.com/api/search/{work_id}"
@@ -133,7 +149,7 @@ def has_valid_asmr_subtitle_result(data, work_id):
     return True
 
 
-async def query_asmr_subtitle(session, work_id, cache):
+async def query_asmr_subtitle(session, work_id, cache, refresh_missing=False):
     work_id = work_id.upper()
     if not work_id.startswith("RJ"):
         return False
@@ -141,6 +157,8 @@ async def query_asmr_subtitle(session, work_id, cache):
     cached = get_cached_asmr_subtitle(cache, work_id)
     if cached is not None:
         return cached
+    if not refresh_missing:
+        return None
 
     url = build_asmr_subtitle_api_url(work_id)
     for attempt in range(1, ASMR_SUBTITLE_MAX_RETRIES + 1):
@@ -157,7 +175,7 @@ async def query_asmr_subtitle(session, work_id, cache):
                     continue
                 if resp.status != 200:
                     print(f"  字幕 API 状态异常: {work_id} HTTP {resp.status}")
-                    return False
+                    return None
                 data = await resp.json(content_type=None)
                 has_subtitle = has_valid_asmr_subtitle_result(data, work_id)
                 set_cached_asmr_subtitle(cache, work_id, has_subtitle)
@@ -169,9 +187,31 @@ async def query_asmr_subtitle(session, work_id, cache):
                 await asyncio.sleep(wait_seconds)
                 continue
             print(f"  字幕 API 查询失败: {work_id} - {e}")
-            return False
+            return None
 
-    return False
+    return None
+
+
+class DownloadCoordinator:
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._events = {}
+
+    async def claim(self, work_id):
+        async with self._lock:
+            event = self._events.get(work_id)
+            if event is None:
+                self._events[work_id] = asyncio.Event()
+                return True
+
+        await event.wait()
+        return False
+
+    async def release(self, work_id):
+        async with self._lock:
+            event = self._events.pop(work_id, None)
+        if event:
+            event.set()
 
 
 def clean_listing_text(html):
@@ -298,15 +338,45 @@ def build_announce_url(work_id, work_url=""):
 def parse_cli_queue_args():
     raw_args = [arg.strip() for arg in sys.argv[1:] if arg.strip()]
     if not raw_args:
-        return None, None, None
+        return None, None, None, None, None
 
-    subtitle_asmr_only = False
+    subtitle_asmr_only = None
+    subtitle_cache_only = None
+    url_queue_concurrency = None
     args = []
-    for arg in raw_args:
+    idx = 0
+    while idx < len(raw_args):
+        arg = raw_args[idx]
         if arg in ASMR_SUBTITLE_FILTER_FLAGS:
             subtitle_asmr_only = True
+            idx += 1
             continue
+        if arg in ASMR_SUBTITLE_CACHE_ONLY_FLAGS:
+            subtitle_cache_only = True
+            idx += 1
+            continue
+        if arg in ASMR_SUBTITLE_REFRESH_FLAGS:
+            subtitle_cache_only = False
+            idx += 1
+            continue
+        if any(arg.startswith(flag + "=") for flag in URL_QUEUE_CONCURRENCY_FLAGS):
+            value = arg.split("=", 1)[1].strip()
+            try:
+                url_queue_concurrency = int(value)
+            except ValueError:
+                url_queue_concurrency = None
+            idx += 1
+            continue
+        if arg in URL_QUEUE_CONCURRENCY_FLAGS:
+            if idx + 1 < len(raw_args):
+                try:
+                    url_queue_concurrency = int(raw_args[idx + 1].strip())
+                except ValueError:
+                    url_queue_concurrency = None
+                idx += 2
+                continue
         args.append(arg)
+        idx += 1
 
     max_pages = None
     if len(args) >= 2 and args[-1].isdigit():
@@ -314,9 +384,9 @@ def parse_cli_queue_args():
         args = args[:-1]
 
     if not args:
-        return None, max_pages, subtitle_asmr_only
+        return None, max_pages, subtitle_asmr_only, url_queue_concurrency, subtitle_cache_only
 
-    return args, max_pages, subtitle_asmr_only
+    return args, max_pages, subtitle_asmr_only, url_queue_concurrency, subtitle_cache_only
 
 
 def load_url_history():
@@ -363,6 +433,30 @@ def prompt_search_urls():
         if history and user_input.lower() == 'all':
             print(f"  已选择全部 {len(history)} 个历史 URL")
             urls.extend(history)
+            continue
+
+        if user_input.lower() == 'getall':
+            genre_map = load_genre_name_map()
+            if not genre_map:
+                print("  list.devtools 未找到分类数据")
+                continue
+
+            template = (
+                "https://www.dlsite.com/maniax/fsr/=/language/jp/sex_category[0]/male/"
+                "order/trend/work_type_category[0]/game/work_type_category[1]/audio/"
+                "genre[0]/415/options_and_or/and/options[0]/JPN/options[1]/CHI_HANS/"
+                "options[2]/CHI_HANT/options[3]/NM/per_page/100/"
+                "lang_options[0]/%E6%97%A5%E8%AF%AD/"
+                "lang_options[1]/%E4%B8%AD%E6%96%87(%E7%AE%80%E4%BD%93%E5%AD%97)/"
+                "lang_options[2]/%E4%B8%AD%E6%96%87(%E7%B9%81%E4%BD%93%E5%AD%97)/"
+                "lang_options[3]/%E6%97%A0%E8%AF%AD%E8%A8%80%E9%99%90%E5%88%B6"
+            )
+            genre_ids = sorted(genre_map.keys(), key=int)
+            for gid in genre_ids:
+                new_url = re.sub(r'genre\[0\]/\d+', f'genre[0]/{gid}', template)
+                urls.append(new_url)
+
+            print(f"  已从 list.devtools 添加全部 {len(genre_ids)} 个分类到队列")
             continue
 
         if history and re.match(r'^[\d,\s]+$', user_input):
@@ -420,11 +514,63 @@ def prompt_max_pages():
     return max_pages
 
 
+def normalize_url_queue_concurrency(value, url_count):
+    if url_count <= 1:
+        return 1
+
+    fallback = min(DEFAULT_URL_QUEUE_CONCURRENCY, url_count, MAX_URL_QUEUE_CONCURRENCY)
+    try:
+        concurrency = int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+    if concurrency < 1:
+        return 1
+    return min(concurrency, url_count, MAX_URL_QUEUE_CONCURRENCY)
+
+
+def prompt_url_queue_concurrency(url_count):
+    if url_count <= 1:
+        return 1
+
+    default_value = min(DEFAULT_URL_QUEUE_CONCURRENCY, url_count, MAX_URL_QUEUE_CONCURRENCY)
+    value = input(
+        f"同时并发处理几个链接？(1-{min(url_count, MAX_URL_QUEUE_CONCURRENCY)}，留空={default_value}): "
+    ).strip()
+
+    if not value:
+        return default_value
+
+    try:
+        concurrency = int(value)
+    except ValueError:
+        print(f"并发数输入无效，使用默认值 {default_value}")
+        return default_value
+
+    if concurrency < 1:
+        print("并发数不能小于 1，使用 1")
+        return 1
+
+    max_allowed = min(url_count, MAX_URL_QUEUE_CONCURRENCY)
+    if concurrency > max_allowed:
+        print(f"并发数过大，已调整为 {max_allowed}")
+        return max_allowed
+
+    return concurrency
+
+
 def prompt_subtitle_asmr_only():
     value = input("是否只下载有字幕的音声 ASMR？(y/N): ").strip().lower()
     if not value:
         return True
     return value in ("y", "yes", "1", "true", "是")
+
+
+def prompt_subtitle_cache_only():
+    value = input("字幕筛选是否只使用本地 asmr_subtitle_cache.json？(Y/n): ").strip().lower()
+    if not value:
+        return True
+    return value not in ("n", "no", "0", "false", "否")
 
 
 def split_decoded_path(url):
@@ -506,14 +652,19 @@ def load_genre_name_map():
 
 def extract_category_name(url):
     genre_name = extract_value_after_path_key(url, "genre_name[0]")
-    if genre_name:
-        return genre_name
-
     genre_id = extract_value_after_path_key(url, "genre[0]")
     if genre_id:
         if genre_id.isdigit():
-            return load_genre_name_map().get(genre_id, f"genre_{genre_id}")
+            mapped_name = load_genre_name_map().get(genre_id)
+            if mapped_name:
+                return mapped_name
+            if genre_name:
+                return genre_name
+            return f"genre_{genre_id}"
         return genre_id
+
+    if genre_name:
+        return genre_name
 
     for key in ("work_type_category_name[0]", "keyword"):
         value = extract_value_after_path_key(url, key)
@@ -527,6 +678,89 @@ def make_safe_slug(name):
     slug = re.sub(r"\s+", "_", slug)
     slug = slug.strip(" ._")
     return slug or "uncategorized"
+
+
+def build_category_merge_key(name, slug, source_url):
+    genre_id = extract_value_after_path_key(source_url, "genre[0]")
+    if genre_id and genre_id.isdigit():
+        return f"genre:{genre_id}"
+    if slug:
+        return f"slug:{slug}"
+    return f"name:{name}"
+
+
+def normalize_crawl_category_entry(entry):
+    if not isinstance(entry, dict):
+        return None
+
+    source_url = entry.get("source_url", "")
+    old_name = entry.get("name") or "未分类"
+    genre_id = extract_value_after_path_key(source_url, "genre[0]")
+    mapped_name = load_genre_name_map().get(genre_id) if genre_id and genre_id.isdigit() else ""
+    name = mapped_name or old_name
+
+    old_slug = entry.get("slug") or ""
+    default_old_slug = make_safe_slug(old_name)
+    if genre_id and (not old_slug or old_slug == default_old_slug or old_name != name):
+        slug = make_safe_slug(name)
+    else:
+        slug = old_slug or make_safe_slug(name)
+
+    return {
+        "name": name,
+        "slug": slug,
+        "source_url": source_url,
+        "updated_at": entry.get("updated_at", ""),
+        "work_ids": unique_ids(entry.get("work_ids", []) if isinstance(entry.get("work_ids"), list) else []),
+    }
+
+
+def merge_crawl_categories(categories):
+    merged = []
+    merged_by_key = {}
+    changed = False
+
+    for raw_entry in categories if isinstance(categories, list) else []:
+        entry = normalize_crawl_category_entry(raw_entry)
+        if not entry:
+            changed = True
+            continue
+
+        merge_key = build_category_merge_key(entry["name"], entry["slug"], entry["source_url"])
+        existing_idx = merged_by_key.get(merge_key)
+        if existing_idx is None:
+            merged_by_key[merge_key] = len(merged)
+            merged.append(entry)
+            if entry != raw_entry:
+                changed = True
+            continue
+
+        existing = merged[existing_idx]
+        merged_work_ids = unique_ids(existing.get("work_ids", []) + entry.get("work_ids", []))
+        if merged_work_ids != existing.get("work_ids", []):
+            existing["work_ids"] = merged_work_ids
+            changed = True
+
+        if entry.get("updated_at", "") > existing.get("updated_at", ""):
+            existing["updated_at"] = entry["updated_at"]
+
+        if entry.get("source_url") and not existing.get("source_url"):
+            existing["source_url"] = entry["source_url"]
+
+    used_slugs = set()
+    for entry in merged:
+        base_slug = entry.get("slug") or make_safe_slug(entry.get("name") or "未分类")
+        slug = base_slug
+        suffix = 2
+        while slug in used_slugs:
+            slug = f"{base_slug}_{suffix}"
+            suffix += 1
+        if slug != entry.get("slug"):
+            entry["slug"] = slug
+            changed = True
+        used_slugs.add(slug)
+
+    return merged, changed
 
 
 def build_page_template(url):
@@ -566,10 +800,20 @@ def load_crawl_results():
         return {"categories": []}
 
     if isinstance(data, dict) and isinstance(data.get("categories"), list):
-        return data
-    if isinstance(data, list):
-        return {"categories": data}
-    return {"categories": []}
+        result = data
+    elif isinstance(data, list):
+        result = {"categories": data}
+    else:
+        result = {"categories": []}
+
+    merged_categories, changed = merge_crawl_categories(result.get("categories", []))
+    result["categories"] = merged_categories
+
+    if changed:
+        with open(CRAWL_RESULTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+
+    return result
 
 
 def unique_ids(ids):
@@ -611,27 +855,34 @@ def save_crawl_result(category_name, category_slug, source_url, work_ids):
     data = load_crawl_results()
     categories = data.setdefault("categories", [])
 
-    new_work_ids = unique_ids(work_ids)
-
-    entry = {
+    entry = normalize_crawl_category_entry({
         "name": category_name,
         "slug": category_slug,
         "source_url": source_url,
         "updated_at": datetime.now().isoformat(timespec="seconds"),
-        "work_ids": new_work_ids,
-    }
+        "work_ids": unique_ids(work_ids),
+    })
+    merge_key = build_category_merge_key(entry["name"], entry["slug"], entry["source_url"])
 
     for idx, existing in enumerate(categories):
-        if existing.get("slug") == category_slug:
+        existing_key = build_category_merge_key(
+            existing.get("name", ""),
+            existing.get("slug", ""),
+            existing.get("source_url", ""),
+        )
+        if existing_key == merge_key or existing.get("slug") == entry["slug"]:
             # Keep category membership additive. A work can belong to multiple
             # categories, and partial crawls must not shrink older results.
-            merged_work_ids = unique_ids(new_work_ids + existing.get("work_ids", []))
+            merged_work_ids = unique_ids(entry["work_ids"] + existing.get("work_ids", []))
             existing.update(entry)
             existing["work_ids"] = merged_work_ids
             categories[idx] = existing
             break
     else:
         categories.append(entry)
+
+    categories, _ = merge_crawl_categories(categories)
+    data["categories"] = categories
 
     with open(CRAWL_RESULTS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -649,102 +900,144 @@ def log_failed_work(work_id, work_name, work_url):
         f.write(f"| {work_id} | {work_name} | {work_url} |\n")
 
 
-async def download_work(session, work_id, work_name, work_url):
+async def download_work(session, work_id, work_name, work_url, download_coordinator=None, log_prefix=""):
     """Download a single work HTML file."""
     save_path = WORKS_DIR / f"{work_id}.html"
     announce_url = build_announce_url(work_id, work_url)
     use_announce_url = False
     last_url = work_url
+    owns_download = False
 
-    for attempt in range(1, MAX_WORK_RETRIES + 1):
-        current_url = announce_url if use_announce_url else work_url
-        last_url = current_url
+    if download_coordinator is not None:
+        while True:
+            if is_valid_saved_work_file(save_path):
+                return "skipped"
+            owns_download = await download_coordinator.claim(work_id)
+            if owns_download:
+                break
+            if is_valid_saved_work_file(save_path):
+                return "skipped"
+    elif is_valid_saved_work_file(save_path):
+        return "skipped"
 
-        if use_announce_url:
-            print(f"  使用预告页重试: {work_id}")
+    try:
+        for attempt in range(1, MAX_WORK_RETRIES + 1):
+            current_url = announce_url if use_announce_url else work_url
+            last_url = current_url
 
-        html = await download_page(session, current_url)
-        valid, reason = is_valid_work_html(html)
+            if use_announce_url:
+                print(f"{log_prefix}使用预告页重试: {work_id}")
 
-        if valid:
-            with open(save_path, "w", encoding="utf-8") as f:
-                f.write(html)
-            print(f"  已保存: {work_id}.html")
-            return True
+            html = await download_page(session, current_url)
+            valid, reason = is_valid_work_html(html)
 
-        print(f"  抓取无效: {work_id} - {reason} ({attempt}/{MAX_WORK_RETRIES})")
-        if reason == "没有解析到作品名" and current_url != announce_url:
-            use_announce_url = True
+            if valid:
+                with open(save_path, "w", encoding="utf-8") as f:
+                    f.write(html)
+                print(f"{log_prefix}已保存: {work_id}.html")
+                return "downloaded"
 
-        if attempt < MAX_WORK_RETRIES:
-            print(f"  {WORK_RETRY_DELAY} 秒后重试: {work_id}")
-            await asyncio.sleep(WORK_RETRY_DELAY)
+            print(f"{log_prefix}抓取无效: {work_id} - {reason} ({attempt}/{MAX_WORK_RETRIES})")
+            if reason == "没有解析到作品名" and current_url != announce_url:
+                use_announce_url = True
 
-    log_failed_work(work_id, work_name, last_url)
-    return False
+            if attempt < MAX_WORK_RETRIES:
+                print(f"{log_prefix}{WORK_RETRY_DELAY} 秒后重试: {work_id}")
+                await asyncio.sleep(WORK_RETRY_DELAY)
+
+        log_failed_work(work_id, work_name, last_url)
+        return "failed"
+    finally:
+        if owns_download and download_coordinator is not None:
+            await download_coordinator.release(work_id)
 
 
-async def download_works_from_page(session, work_links, page_num):
+async def download_works_from_page(session, work_links, page_num, download_coordinator=None, log_prefix=""):
     """Download all new works from one listing page."""
     works_to_download = []
 
     for work in work_links:
         save_path = WORKS_DIR / f"{work['id']}.html"
         if is_valid_saved_work_file(save_path):
-            print(f"  跳过已存在且有效: {work['id']}.html")
+            print(f"{log_prefix}跳过已存在且有效: {work['id']}.html")
         else:
             if save_path.exists():
-                print(f"  已存在但没有作品名，重新下载: {work['id']}.html")
+                print(f"{log_prefix}已存在但没有作品名，重新下载: {work['id']}.html")
             works_to_download.append(work)
 
     if not works_to_download:
-        print(f"  第 {page_num} 页的作品都已下载过")
+        print(f"{log_prefix}第 {page_num} 页的作品都已下载过")
         return 0, 0
 
-    print(f"\n  开始下载第 {page_num} 页的 {len(works_to_download)} 个新作品...")
-    print(f"  使用 {MAX_CONCURRENT} 个并发连接\n")
+    print(f"\n{log_prefix}开始下载第 {page_num} 页的 {len(works_to_download)} 个新作品...")
+    print(f"{log_prefix}使用每链接 {MAX_CONCURRENT} 个并发连接\n")
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
     async def bounded_download(work):
         async with semaphore:
-            print(f"  下载中: {work['id']}")
-            success = await download_work(session, work["id"], work["name"], work["url"])
+            print(f"{log_prefix}下载中: {work['id']}")
+            result = await download_work(
+                session,
+                work["id"],
+                work["name"],
+                work["url"],
+                download_coordinator=download_coordinator,
+                log_prefix=log_prefix,
+            )
             await asyncio.sleep(0.1)
-            return success
+            return result
 
     results = await asyncio.gather(*[bounded_download(work) for work in works_to_download])
-    total_downloaded = sum(results)
-    total_failed = len(results) - total_downloaded
+    total_downloaded = sum(1 for result in results if result == "downloaded")
+    total_failed = sum(1 for result in results if result == "failed")
+    total_reused = sum(1 for result in results if result == "skipped")
+    if total_reused > 0:
+        print(f"{log_prefix}其中 {total_reused} 个作品已由其他并发任务完成，已直接复用")
     return total_downloaded, total_failed
 
 
-async def filter_subtitled_audio_asmr_links(session, work_links, subtitle_cache):
+async def filter_subtitled_audio_asmr_links(
+    session,
+    work_links,
+    subtitle_cache,
+    refresh_missing=False,
+    log_prefix="",
+):
     if not work_links:
-        return [], 0
+        return [], 0, 0
 
     kept = []
     skipped = 0
+    skipped_unknown = 0
     semaphore = asyncio.Semaphore(ASMR_SUBTITLE_CONCURRENCY)
 
     async def check_work(work):
         if not work.get("is_audio_asmr"):
             return work, True
         async with semaphore:
-            has_subtitle = await query_asmr_subtitle(session, work["id"], subtitle_cache)
+            has_subtitle = await query_asmr_subtitle(
+                session,
+                work["id"],
+                subtitle_cache,
+                refresh_missing=refresh_missing,
+            )
             return work, has_subtitle
 
     results = await asyncio.gather(*(check_work(work) for work in work_links))
     for work, keep in results:
-        if keep:
+        if keep is True:
             kept.append(work)
-        else:
+        elif keep is False:
             skipped += 1
-            print(f"  跳过无字幕音声 ASMR: {work['id']} {work.get('name', '')}")
+            print(f"{log_prefix}跳过无字幕音声 ASMR: {work['id']} {work.get('name', '')}")
+        else:
+            skipped_unknown += 1
+            print(f"{log_prefix}本地字幕缓存缺失，跳过未确认音声 ASMR: {work['id']} {work.get('name', '')}")
 
-    if skipped:
+    if refresh_missing and (skipped or skipped_unknown):
         save_asmr_subtitle_cache(subtitle_cache)
-    return kept, skipped
+    return kept, skipped, skipped_unknown
 
 
 async def crawl_search_url(
@@ -754,88 +1047,105 @@ async def crawl_search_url(
     queue_index=1,
     queue_total=1,
     subtitle_asmr_only=False,
+    subtitle_cache_only=True,
     subtitle_cache=None,
+    download_coordinator=None,
 ):
     page_template, start_page = build_page_template(search_url)
     category_name = extract_category_name(search_url)
     category_slug = make_safe_slug(category_name)
+    queue_tag = f"[{queue_index}/{queue_total} {category_name}] "
 
     print("\n" + "=" * 60)
     if queue_total > 1:
-        print(f"队列 {queue_index}/{queue_total}")
-    print(f"分类: {category_name}")
-    print(f"起始页: {start_page}")
-    print(f"最大页数: {'不限制' if max_pages == 0 else max_pages}")
-    print(f"只下载有字幕音声 ASMR: {'是' if subtitle_asmr_only else '否'}")
-    print(f"URL 模板: {page_template}")
+        print(f"{queue_tag}开始")
+    print(f"{queue_tag}分类: {category_name}")
+    print(f"{queue_tag}起始页: {start_page}")
+    print(f"{queue_tag}最大页数: {'不限制' if max_pages == 0 else max_pages}")
+    print(f"{queue_tag}只下载有字幕音声 ASMR: {'是' if subtitle_asmr_only else '否'}")
+    if subtitle_asmr_only:
+        print(f"{queue_tag}字幕筛选数据源: {'仅本地缓存' if subtitle_cache_only else '缓存缺失时查询 API'}")
+    print(f"{queue_tag}URL 模板: {page_template}")
 
     all_work_ids = []
     page = start_page
     total_downloaded = 0
     total_failed = 0
     total_skipped_no_subtitle = 0
+    total_skipped_unknown_subtitle = 0
 
     while True:
-        print(f"\n正在处理第 {page} 页...")
+        print(f"\n{queue_tag}正在处理第 {page} 页...")
         search_page_url = page_template.format(page=page)
 
         search_html = await download_page(session, search_page_url)
         if not search_html:
-            print(f"  无法下载第 {page} 页，停止")
+            print(f"{queue_tag}无法下载第 {page} 页，停止")
             break
 
         work_links = extract_work_links(search_html, search_page_url)
         if not work_links:
-            print(f"  第 {page} 页没有找到作品链接，停止")
+            print(f"{queue_tag}第 {page} 页没有找到作品链接，停止")
             break
 
-        print(f"  第 {page} 页找到 {len(work_links)} 个作品")
+        print(f"{queue_tag}第 {page} 页找到 {len(work_links)} 个作品")
 
         if subtitle_asmr_only:
-            work_links, skipped_no_subtitle = await filter_subtitled_audio_asmr_links(
+            work_links, skipped_no_subtitle, skipped_unknown_subtitle = await filter_subtitled_audio_asmr_links(
                 session,
                 work_links,
                 subtitle_cache if subtitle_cache is not None else {},
+                refresh_missing=not subtitle_cache_only,
+                log_prefix=queue_tag,
             )
             total_skipped_no_subtitle += skipped_no_subtitle
-            print(f"  字幕筛选后保留 {len(work_links)} 个作品")
+            total_skipped_unknown_subtitle += skipped_unknown_subtitle
+            print(f"{queue_tag}字幕筛选后保留 {len(work_links)} 个作品")
 
         for work in work_links:
             all_work_ids.append(work["id"])
 
         if work_links:
-            downloaded, failed = await download_works_from_page(session, work_links, page)
+            downloaded, failed = await download_works_from_page(
+                session,
+                work_links,
+                page,
+                download_coordinator=download_coordinator,
+                log_prefix=queue_tag,
+            )
             total_downloaded += downloaded
             total_failed += failed
         else:
-            print(f"  第 {page} 页没有符合字幕筛选条件的作品")
+            print(f"{queue_tag}第 {page} 页没有符合字幕筛选条件的作品")
 
         pages_done = page - start_page + 1
         if max_pages > 0 and pages_done >= max_pages:
-            print(f"\n已达到最大爬取页数限制: {max_pages}")
+            print(f"\n{queue_tag}已达到最大爬取页数限制: {max_pages}")
             break
 
         if not has_next_page(search_html, page):
-            print("\n没有更多页面了")
+            print(f"\n{queue_tag}没有更多页面了")
             break
 
         page += 1
-        print("\n  等待 0.1 秒后继续下一页...")
+        print(f"\n{queue_tag}等待 0.1 秒后继续下一页...")
         await asyncio.sleep(0.1)
 
-    print("\n分类爬取完成:")
-    print(f"  - 分类: {category_name}")
-    print(f"  - 新下载: {total_downloaded} 个作品")
+    print(f"\n{queue_tag}分类爬取完成:")
+    print(f"{queue_tag}- 分类: {category_name}")
+    print(f"{queue_tag}- 新下载: {total_downloaded} 个作品")
     if total_skipped_no_subtitle > 0:
-        print(f"  - 跳过无字幕音声 ASMR: {total_skipped_no_subtitle} 个作品")
+        print(f"{queue_tag}- 跳过无字幕音声 ASMR: {total_skipped_no_subtitle} 个作品")
+    if total_skipped_unknown_subtitle > 0:
+        print(f"{queue_tag}- 因本地缓存缺失而跳过: {total_skipped_unknown_subtitle} 个作品")
     if total_failed > 0:
-        print(f"  - 下载失败: {total_failed} 个作品 (详情查看 failed_works.md)")
+        print(f"{queue_tag}- 下载失败: {total_failed} 个作品 (详情查看 failed_works.md)")
 
     if all_work_ids:
         save_crawl_result(category_name, category_slug, search_url, all_work_ids)
-        print(f"  - 已记录分类结果: {CRAWL_RESULTS_FILE} -> {category_name} ({len(unique_ids(all_work_ids))} 个作品)")
+        print(f"{queue_tag}- 已记录分类结果: {CRAWL_RESULTS_FILE} -> {category_name} ({len(unique_ids(all_work_ids))} 个作品)")
     else:
-        print("  - 没有抓到作品 ID，跳过分类记录")
+        print(f"{queue_tag}- 没有抓到作品 ID，跳过分类记录")
 
     return {
         "category_name": category_name,
@@ -843,17 +1153,34 @@ async def crawl_search_url(
         "downloaded": total_downloaded,
         "failed": total_failed,
         "skipped_no_subtitle": total_skipped_no_subtitle,
+        "skipped_unknown_subtitle": total_skipped_unknown_subtitle,
     }
 
 
 async def main():
-    cli_urls, cli_max_pages, cli_subtitle_asmr_only = parse_cli_queue_args()
+    (
+        cli_urls,
+        cli_max_pages,
+        cli_subtitle_asmr_only,
+        cli_url_queue_concurrency,
+        cli_subtitle_cache_only,
+    ) = parse_cli_queue_args()
     search_urls = cli_urls if cli_urls is not None else prompt_search_urls()
     max_pages = cli_max_pages if cli_max_pages is not None else prompt_max_pages()
     subtitle_asmr_only = (
         cli_subtitle_asmr_only
         if cli_subtitle_asmr_only is not None
         else prompt_subtitle_asmr_only()
+    )
+    subtitle_cache_only = (
+        cli_subtitle_cache_only
+        if cli_subtitle_cache_only is not None
+        else (prompt_subtitle_cache_only() if subtitle_asmr_only else True)
+    )
+    url_queue_concurrency = (
+        normalize_url_queue_concurrency(cli_url_queue_concurrency, len(search_urls))
+        if cli_url_queue_concurrency is not None
+        else prompt_url_queue_concurrency(len(search_urls))
     )
 
     save_url_history(search_urls)
@@ -863,33 +1190,52 @@ async def main():
     print("开始爬取 DLsite 作品...")
     print("=" * 60)
     print(f"队列链接数: {len(search_urls)}")
+    print(f"链接并发数: {url_queue_concurrency}")
     print(f"每个链接最大页数: {'不限制' if max_pages == 0 else max_pages}")
     print(f"只下载有字幕音声 ASMR: {'是' if subtitle_asmr_only else '否'}")
+    if subtitle_asmr_only:
+        print(f"字幕筛选数据源: {'仅本地缓存' if subtitle_cache_only else '缓存缺失时查询 API'}")
 
     queue_work_ids = []
     total_downloaded = 0
     total_failed = 0
     total_skipped_no_subtitle = 0
+    total_skipped_unknown_subtitle = 0
     subtitle_cache = load_asmr_subtitle_cache() if subtitle_asmr_only else {}
+    download_coordinator = DownloadCoordinator()
+    connector_limit = min(MAX_TOTAL_CONCURRENT, max(MAX_CONCURRENT, MAX_CONCURRENT * url_queue_concurrency))
+    print(f"总连接并发上限: {connector_limit}")
 
-    connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT)
+    connector = aiohttp.TCPConnector(limit=connector_limit)
     async with aiohttp.ClientSession(headers=HEADERS, connector=connector) as session:
-        for index, search_url in enumerate(search_urls, start=1):
-            result = await crawl_search_url(
-                session,
-                search_url,
-                max_pages,
-                index,
-                len(search_urls),
-                subtitle_asmr_only=subtitle_asmr_only,
-                subtitle_cache=subtitle_cache,
-            )
+        queue_semaphore = asyncio.Semaphore(url_queue_concurrency)
+
+        async def bounded_crawl(index, search_url):
+            async with queue_semaphore:
+                return await crawl_search_url(
+                    session,
+                    search_url,
+                    max_pages,
+                    index,
+                    len(search_urls),
+                    subtitle_asmr_only=subtitle_asmr_only,
+                    subtitle_cache_only=subtitle_cache_only,
+                    subtitle_cache=subtitle_cache,
+                    download_coordinator=download_coordinator,
+                )
+
+        results = await asyncio.gather(
+            *(bounded_crawl(index, search_url) for index, search_url in enumerate(search_urls, start=1))
+        )
+
+        for result in results:
             queue_work_ids.extend(result["work_ids"])
             total_downloaded += result["downloaded"]
             total_failed += result["failed"]
             total_skipped_no_subtitle += result.get("skipped_no_subtitle", 0)
+            total_skipped_unknown_subtitle += result.get("skipped_unknown_subtitle", 0)
 
-    if subtitle_asmr_only:
+    if subtitle_asmr_only and not subtitle_cache_only:
         save_asmr_subtitle_cache(subtitle_cache)
 
     print("\n" + "=" * 60)
@@ -897,6 +1243,8 @@ async def main():
     print(f"  - 新下载: {total_downloaded} 个作品")
     if total_skipped_no_subtitle > 0:
         print(f"  - 跳过无字幕音声 ASMR: {total_skipped_no_subtitle} 个作品")
+    if total_skipped_unknown_subtitle > 0:
+        print(f"  - 因本地缓存缺失而跳过: {total_skipped_unknown_subtitle} 个作品")
     if total_failed > 0:
         print(f"  - 下载失败: {total_failed} 个作品 (详情查看 failed_works.md)")
 

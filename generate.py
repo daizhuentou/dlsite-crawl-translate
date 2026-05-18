@@ -12,8 +12,15 @@ import unicodedata
 import os
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
+
+try:
+    from pypinyin import Style, lazy_pinyin
+except ImportError:
+    Style = None
+    lazy_pinyin = None
 
 
 BASE_DIR = Path(__file__).parent  # 项目根目录
@@ -36,7 +43,7 @@ ASMR_SUBTITLE_CACHE_FILE = BASE_DIR / "asmr_subtitle_cache.json"  # ASMR字幕�
 SLIDER_IMAGES_DIR = IMAGES_DIR / "slider"  # 轮播图存储目录
 PARTS_IMAGES_DIR = IMAGES_DIR / "parts"  # 内容图存储目录
 MAX_CONCURRENT_IMAGES = 300  # 最大并发下载图片数量
-MAX_PARSE_WORKERS = max(12, max(4, (os.cpu_count() or 4)))  # HTML解析线程池大小
+MAX_PARSE_WORKERS = min(12, max(4, (os.cpu_count() or 4)))  # HTML解析线程池大小
 PARSE_PROGRESS_INTERVAL = 500  # 解析HTML进度显示间隔（每处理多少个作品显示一次）
 PAGE_WRITE_LOG_INTERVAL = 100  # 分页JSON写入日志间隔（每写入多少个分页显示一次）
 IMAGE_SCAN_PROGRESS_INTERVAL = 1000  # 扫描作品图片进度显示间隔
@@ -51,11 +58,15 @@ ASMR_SUBTITLE_API_TEMPLATE = (
     "&subtitle=1&includeTranslationWorks=true"
 )
 WORK_FILE_PATTERNS = ("RJ*.html", "VJ*.html")
+_GENRE_NAME_MAP = None
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Referer": "https://www.dlsite.com/"
 }
+
+CJK_CHAR_RE = re.compile(r"[\u3400-\u9fff]")
+CJK_SEGMENT_RE = re.compile(r"[\u3400-\u9fff]+")
 
 
 class DownloadProgressBar:
@@ -951,6 +962,46 @@ def extract_value_after_path_key(url, key):
     return ""
 
 
+def clean_genre_label(label_html):
+    label_html = re.sub(
+        r'<span[^>]*class=["\'][^"\']*number[^"\']*["\'][^>]*>.*?</span>',
+        '',
+        label_html,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    label = re.sub(r'<[^>]+>', '', label_html)
+    label = html_lib.unescape(label)
+    return re.sub(r'\s+', ' ', label).strip()
+
+
+def load_genre_name_map():
+    global _GENRE_NAME_MAP
+    if _GENRE_NAME_MAP is not None:
+        return _GENRE_NAME_MAP
+
+    genre_map = {}
+    genre_list_file = BASE_DIR / "list.devtools"
+    if genre_list_file.exists():
+        try:
+            with open(genre_list_file, "r", encoding="utf-8") as f:
+                content = f.read()
+        except OSError:
+            content = ""
+
+        for match in re.finditer(
+            r'<a\s+[^>]*href=["\'][^"\']*/genre/(\d+)[^"\']*["\'][^>]*>(.*?)</a>',
+            content,
+            re.DOTALL | re.IGNORECASE,
+        ):
+            genre_id = match.group(1)
+            label = clean_genre_label(match.group(2))
+            if label and genre_id not in genre_map:
+                genre_map[genre_id] = label
+
+    _GENRE_NAME_MAP = genre_map
+    return _GENRE_NAME_MAP
+
+
 def unique_existing_work_ids(work_ids, works_by_id):
     seen = set()
     result = []
@@ -1044,15 +1095,48 @@ def load_crawl_categories(works_by_id):
         return []
 
     raw_categories = data.get("categories", []) if isinstance(data, dict) else data
-    categories = []
-    used_slugs = set()
+    merged_categories = []
+    merged_by_key = {}
+    genre_name_map = load_genre_name_map()
 
     for item in raw_categories:
         if not isinstance(item, dict):
             continue
 
-        name = item.get("name") or "未分类"
-        slug = make_safe_slug(item.get("slug") or name)
+        source_url = item.get("source_url", "")
+        old_name = item.get("name") or "未分类"
+        genre_id = extract_value_after_path_key(source_url, "genre[0]")
+        name = genre_name_map.get(genre_id, old_name) if genre_id else old_name
+
+        work_ids = unique_existing_work_ids(item.get("work_ids", []), works_by_id)
+        if not work_ids:
+            continue
+
+        old_slug = item.get("slug") or ""
+        default_old_slug = make_safe_slug(old_name)
+        slug = make_safe_slug(name if genre_id and (not old_slug or old_slug == default_old_slug or old_name != name) else (old_slug or name))
+        merge_key = f"genre:{genre_id}" if genre_id else f"slug:{slug}"
+        existing_idx = merged_by_key.get(merge_key)
+        if existing_idx is not None:
+            existing = merged_categories[existing_idx]
+            existing["work_ids"] = unique_existing_work_ids(existing["work_ids"] + work_ids, works_by_id)
+            if item.get("updated_at", "") > existing.get("updated_at", ""):
+                existing["updated_at"] = item.get("updated_at", "")
+            continue
+
+        merged_by_key[merge_key] = len(merged_categories)
+        merged_categories.append({
+            "name": name,
+            "slug": slug,
+            "source_url": source_url,
+            "updated_at": item.get("updated_at", ""),
+            "work_ids": work_ids,
+        })
+
+    categories = []
+    used_slugs = set()
+    for entry in merged_categories:
+        slug = entry["slug"]
         base_slug = slug
         suffix = 2
         while slug in used_slugs:
@@ -1060,17 +1144,9 @@ def load_crawl_categories(works_by_id):
             suffix += 1
         used_slugs.add(slug)
 
-        work_ids = unique_existing_work_ids(item.get("work_ids", []), works_by_id)
-        if not work_ids:
-            continue
-
-        categories.append({
-            "name": name,
-            "slug": slug,
-            "source_url": item.get("source_url", ""),
-            "updated_at": item.get("updated_at", ""),
-            "work_ids": work_ids,
-        })
+        normalized_entry = dict(entry)
+        normalized_entry["slug"] = slug
+        categories.append(normalized_entry)
 
     return categories
 
@@ -1087,7 +1163,7 @@ def collect_work_kinds(works):
     return [kind for kind in order if kind in kinds]
 
 
-def build_manifest_entry(name, slug, count, data_path, translate_path="", source_url="", updated_at="", work_kinds=None, index_path=""):
+def build_manifest_entry(name, slug, count, data_path, translate_path="", source_url="", updated_at="", work_kinds=None, index_path="", search_text=""):
     return {
         "name": name,
         "slug": slug,
@@ -1100,6 +1176,7 @@ def build_manifest_entry(name, slug, count, data_path, translate_path="", source
         "updated_at": updated_at,
         "genre_id": extract_value_after_path_key(source_url, "genre[0]") if source_url else "",
         "work_kinds": work_kinds or [],
+        "search_text": normalize_search_text(search_text or build_pinyin_search_text(name)),
     }
 
 
@@ -1153,7 +1230,62 @@ def normalize_search_text(value):
     return re.sub(r"\s+", " ", value).strip()
 
 
-def build_search_text(work):
+def dedupe_text_tokens(tokens):
+    seen = set()
+    result = []
+    for token in tokens:
+        token = normalize_search_text(token).replace(" ", "")
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        result.append(token)
+    return result
+
+
+def compact_search_token(value):
+    return normalize_search_text(value).replace(" ", "")
+
+
+@lru_cache(maxsize=32768)
+def build_pinyin_search_text(value):
+    text = str(value or "").strip()
+    if not text or lazy_pinyin is None or not CJK_CHAR_RE.search(text):
+        return ""
+
+    full_parts = []
+    initials = []
+    for segment in CJK_SEGMENT_RE.findall(text):
+        segment_full = [
+            compact_search_token(part)
+            for part in lazy_pinyin(segment, strict=False, errors="ignore")
+        ]
+        segment_full = [part for part in segment_full if part]
+        if not segment_full:
+            continue
+        full_parts.extend(segment_full)
+        if Style is not None:
+            segment_initials = [
+                compact_search_token(part)
+                for part in lazy_pinyin(
+                    segment,
+                    style=Style.FIRST_LETTER,
+                    strict=False,
+                    errors="ignore",
+                )
+            ]
+            initials.extend(part for part in segment_initials if part)
+
+    tokens = list(full_parts)
+    if full_parts:
+        tokens.append("".join(full_parts))
+        tokens.append(" ".join(full_parts))
+    if initials:
+        tokens.append("".join(initials))
+        tokens.append(" ".join(initials))
+    return " ".join(dedupe_text_tokens(tokens))
+
+
+def build_search_text(work, category_names=None):
     values = [
         work.get("product_id", ""),
         work.get("work_name", ""),
@@ -1164,21 +1296,46 @@ def build_search_text(work):
         work.get("version_label", ""),
     ]
     values.extend(work.get("work_types", []))
+    values.extend(category_names or [])
     return normalize_search_text(" ".join(values))
+
+
+def build_search_alias_text(work, category_names=None):
+    values = [
+        work.get("work_name", ""),
+        work.get("maker_name", ""),
+        work.get("work_kind", WORK_KIND_GAME),
+        work.get("version_lang", ""),
+        work.get("version_label", ""),
+    ]
+    values.extend(work.get("work_types", []))
+    values.extend(category_names or [])
+    return normalize_search_text(
+        " ".join(
+            alias
+            for alias in (build_pinyin_search_text(value) for value in values)
+            if alias
+        )
+    )
 
 
 def write_search_index(works, crawl_categories):
     categories_by_work_id = {}
+    category_names_by_work_id = {}
     for category in crawl_categories:
         slug = category.get("slug")
+        name = category.get("name", "")
         if not slug:
             continue
         for work_id in category.get("work_ids", []):
             categories_by_work_id.setdefault(work_id, set()).add(slug)
+            if name:
+                category_names_by_work_id.setdefault(work_id, set()).add(name)
 
     index = []
     for idx, work in enumerate(works):
         work_id = work["product_id"]
+        category_names = sorted(category_names_by_work_id.get(work_id, set()))
         index.append({
             "product_id": work_id,
             "page": idx // ITEMS_PER_PAGE + 1,
@@ -1187,7 +1344,8 @@ def write_search_index(works, crawl_categories):
             "version_group_id": work.get("version_group_id", work_id),
             "version_rank": work.get("version_rank", 2),
             "categories": sorted(categories_by_work_id.get(work_id, set())),
-            "text": build_search_text(work),
+            "text": build_search_text(work, category_names),
+            "aliases": build_search_alias_text(work, category_names),
         })
 
     with open(SEARCH_INDEX_FILE, "w", encoding="utf-8") as f:
@@ -1459,6 +1617,130 @@ def generate_html(total_works):
             background: rgba(255,255,255,0.96);
             font-size: 0.95em;
             box-shadow: 0 10px 28px rgba(0,0,0,0.22);
+        }
+        .category-picker {
+            position: relative;
+            min-width: 220px;
+            max-width: min(520px, 100%);
+        }
+        .category-select-button {
+            width: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            cursor: pointer;
+            transition: box-shadow 0.2s ease, transform 0.2s ease;
+            text-align: left;
+        }
+        .category-select-button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 14px 34px rgba(0,0,0,0.24);
+        }
+        .category-select-button.open {
+            box-shadow: 0 16px 38px rgba(0,0,0,0.28);
+        }
+        .category-select-label {
+            min-width: 0;
+            flex: 1;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .category-select-arrow {
+            width: 10px;
+            height: 10px;
+            border-right: 2px solid rgba(36,36,62,0.72);
+            border-bottom: 2px solid rgba(36,36,62,0.72);
+            transform: rotate(45deg) translateY(-1px);
+            transition: transform 0.2s ease;
+            flex-shrink: 0;
+            margin-right: 2px;
+        }
+        .category-select-button.open .category-select-arrow {
+            transform: rotate(-135deg) translateY(-1px);
+        }
+        .category-dropdown {
+            position: absolute;
+            top: calc(100% + 10px);
+            left: 0;
+            width: min(420px, calc(100vw - 32px));
+            background: rgba(255,255,255,0.98);
+            border-radius: 14px;
+            box-shadow: 0 22px 58px rgba(10,12,38,0.32);
+            overflow: hidden;
+            z-index: 40;
+            backdrop-filter: blur(12px);
+        }
+        .category-dropdown[hidden] {
+            display: none;
+        }
+        .category-search-wrap {
+            padding: 14px;
+            border-bottom: 1px solid rgba(91,104,173,0.12);
+            background: rgba(245,247,255,0.9);
+        }
+        .category-search-input {
+            width: 100%;
+            border: 1px solid rgba(102,126,234,0.2);
+            border-radius: 10px;
+            padding: 10px 14px;
+            font-size: 0.95em;
+            color: #24243e;
+            background: white;
+            outline: none;
+            transition: border-color 0.2s ease, box-shadow 0.2s ease;
+        }
+        .category-search-input:focus {
+            border-color: rgba(102,126,234,0.58);
+            box-shadow: 0 0 0 4px rgba(102,126,234,0.14);
+        }
+        .category-option-list {
+            max-height: min(420px, 55vh);
+            overflow-y: auto;
+            padding: 10px;
+        }
+        .category-option {
+            width: 100%;
+            border: none;
+            background: transparent;
+            color: #24243e;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            padding: 11px 12px;
+            border-radius: 10px;
+            cursor: pointer;
+            text-align: left;
+            transition: background 0.18s ease, color 0.18s ease, transform 0.18s ease;
+        }
+        .category-option:hover {
+            background: rgba(102,126,234,0.1);
+            transform: translateX(2px);
+        }
+        .category-option.active {
+            background: linear-gradient(135deg, rgba(102,126,234,0.16), rgba(118,75,162,0.2));
+            color: #352b66;
+            font-weight: 600;
+        }
+        .category-option-name {
+            min-width: 0;
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .category-option-count {
+            color: rgba(54,58,102,0.7);
+            font-size: 0.84em;
+            flex-shrink: 0;
+        }
+        .category-option-empty {
+            color: rgba(54,58,102,0.7);
+            padding: 18px 12px;
+            text-align: center;
+            font-size: 0.92em;
         }
         .work-type-buttons {
             display: flex;
@@ -1905,7 +2187,18 @@ def generate_html(total_works):
         <div class="category-bar toolbar">
             <div class="control-group">
                 <span class="category-label">分类</span>
-                <select class="category-select" id="categorySelect" onchange="changeCategory(this.value)"></select>
+                <div class="category-picker" id="categoryPicker">
+                    <button class="category-select category-select-button" id="categorySelectButton" type="button" onclick="toggleCategoryPicker()" aria-haspopup="listbox" aria-expanded="false">
+                        <span class="category-select-label" id="categorySelectLabel">全部作品</span>
+                        <span class="category-select-arrow" aria-hidden="true"></span>
+                    </button>
+                    <div class="category-dropdown" id="categoryDropdown" hidden>
+                        <div class="category-search-wrap">
+                            <input class="category-search-input" id="categorySearchInput" type="search" placeholder="搜索分类" autocomplete="off" oninput="updateCategorySearch(this.value)">
+                        </div>
+                        <div class="category-option-list" id="categoryOptionList" role="listbox"></div>
+                    </div>
+                </div>
             </div>
             <div class="control-group">
                 <span class="category-label">作品类型</span>
@@ -1943,6 +2236,7 @@ def generate_html(total_works):
         let searchTerms = [];
         let searchDebounceTimer = null;
         let searchResultEntries = null;
+        let categorySearchQuery = '';
         const pageDataCache = new Map();
         const filterIndexCache = new Map();
         let currentTotalWorks = FALLBACK_TOTAL_WORKS;
@@ -1954,9 +2248,9 @@ def generate_html(total_works):
         const STATUS_CATEGORY_DISLIKED = '__disliked__';
         const STATUS_CATEGORY_PLAYED = '__played__';
         const STATUS_CATEGORIES = {
-            [STATUS_CATEGORY_LIKED]: { name: '喜欢', preference: 'liked' },
-            [STATUS_CATEGORY_DISLIKED]: { name: '不需要', preference: 'disliked' },
-            [STATUS_CATEGORY_PLAYED]: { name: '玩过', preference: 'played' }
+            [STATUS_CATEGORY_LIKED]: { name: '喜欢', preference: 'liked', searchText: 'xihuan xh' },
+            [STATUS_CATEGORY_DISLIKED]: { name: '不需要', preference: 'disliked', searchText: 'buxuyao bxy' },
+            [STATUS_CATEGORY_PLAYED]: { name: '玩过', preference: 'played', searchText: 'wanguo wg' }
         };
         const HIDDEN_PREFERENCES = ['liked', 'disliked', 'played'];
         let workStates = {};
@@ -2009,27 +2303,141 @@ def generate_html(total_works):
         }
 
         function renderCategorySelect() {
-            const select = document.getElementById('categorySelect');
-            const selected = currentCategory ? currentCategory.slug : '';
-            select.innerHTML = '';
-            categories.forEach((category) => {
-                const option = document.createElement('option');
-                option.value = category.slug;
-                option.textContent = category.name + ' (' + category.count + ')';
-                if (category.source_url) {
-                    option.title = category.source_url;
-                }
-                select.appendChild(option);
-            });
-            Object.entries(STATUS_CATEGORIES).forEach(([slug, config]) => {
-                const option = document.createElement('option');
-                option.value = slug;
-                option.textContent = config.name + ' (' + countPreference(config.preference) + ')';
-                select.appendChild(option);
-            });
-            if (selected) {
-                select.value = selected;
+            updateCategoryPickerLabel();
+            renderCategoryOptionList();
+        }
+
+        function getCategoryOptions() {
+            const categoryOptions = categories.map((category) => ({
+                slug: category.slug,
+                name: category.name,
+                count: Number(category.count) || 0,
+                title: category.source_url || '',
+                searchText: normalizeSearchText(category.search_text || '')
+            }));
+            const statusOptions = Object.entries(STATUS_CATEGORIES).map(([slug, config]) => ({
+                slug,
+                name: config.name,
+                count: countPreference(config.preference),
+                title: '',
+                searchText: config.searchText || ''
+            }));
+            return categoryOptions.concat(statusOptions);
+        }
+
+        function updateCategoryPickerLabel() {
+            const label = document.getElementById('categorySelectLabel');
+            if (!label) return;
+            if (currentCategory) {
+                const count = STATUS_CATEGORIES[currentCategory.slug]
+                    ? countPreference(STATUS_CATEGORIES[currentCategory.slug].preference)
+                    : (Number(currentCategory.count) || 0);
+                label.textContent = currentCategory.name + ' (' + count + ')';
+                return;
             }
+            const fallback = categories[0];
+            label.textContent = fallback
+                ? (fallback.name + ' (' + (Number(fallback.count) || 0) + ')')
+                : '全部作品';
+        }
+
+        function getFilteredCategoryOptions() {
+            const options = getCategoryOptions();
+            const terms = categorySearchQuery ? categorySearchQuery.split(' ').filter(Boolean) : [];
+            if (terms.length === 0) return options;
+            return options.filter((option) => {
+                const haystack = normalizeSearchText(option.name + ' ' + option.slug + ' ' + (option.searchText || ''));
+                return terms.every((term) => haystack.includes(term));
+            });
+        }
+
+        function renderCategoryOptionList() {
+            const list = document.getElementById('categoryOptionList');
+            if (!list) return;
+
+            const selected = currentCategory ? currentCategory.slug : '';
+            const options = getFilteredCategoryOptions();
+            list.innerHTML = '';
+
+            if (options.length === 0) {
+                const empty = document.createElement('div');
+                empty.className = 'category-option-empty';
+                empty.textContent = '没有匹配的分类';
+                list.appendChild(empty);
+                return;
+            }
+
+            options.forEach((option) => {
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.className = 'category-option' + (option.slug === selected ? ' active' : '');
+                button.setAttribute('role', 'option');
+                button.setAttribute('aria-selected', option.slug === selected ? 'true' : 'false');
+                if (option.title) {
+                    button.title = option.title;
+                }
+
+                const name = document.createElement('span');
+                name.className = 'category-option-name';
+                name.textContent = option.name;
+
+                const count = document.createElement('span');
+                count.className = 'category-option-count';
+                count.textContent = option.count;
+
+                button.appendChild(name);
+                button.appendChild(count);
+                button.onclick = async () => {
+                    closeCategoryPicker();
+                    await changeCategory(option.slug);
+                };
+                list.appendChild(button);
+            });
+        }
+
+        function updateCategorySearch(value) {
+            categorySearchQuery = normalizeSearchText(value);
+            renderCategoryOptionList();
+        }
+
+        function openCategoryPicker() {
+            const picker = document.getElementById('categoryPicker');
+            const button = document.getElementById('categorySelectButton');
+            const dropdown = document.getElementById('categoryDropdown');
+            const input = document.getElementById('categorySearchInput');
+            if (!picker || !button || !dropdown || !input) return;
+            picker.classList.add('open');
+            button.classList.add('open');
+            button.setAttribute('aria-expanded', 'true');
+            dropdown.hidden = false;
+            renderCategoryOptionList();
+            requestAnimationFrame(() => input.focus());
+        }
+
+        function closeCategoryPicker() {
+            const picker = document.getElementById('categoryPicker');
+            const button = document.getElementById('categorySelectButton');
+            const dropdown = document.getElementById('categoryDropdown');
+            const input = document.getElementById('categorySearchInput');
+            if (!picker || !button || !dropdown || !input) return;
+            picker.classList.remove('open');
+            button.classList.remove('open');
+            button.setAttribute('aria-expanded', 'false');
+            dropdown.hidden = true;
+            if (categorySearchQuery || input.value) {
+                categorySearchQuery = '';
+                input.value = '';
+                renderCategoryOptionList();
+            }
+        }
+
+        function toggleCategoryPicker() {
+            const dropdown = document.getElementById('categoryDropdown');
+            if (!dropdown || dropdown.hidden) {
+                openCategoryPicker();
+                return;
+            }
+            closeCategoryPicker();
         }
 
         function normalizeSearchText(value) {
@@ -2186,7 +2594,8 @@ def generate_html(total_works):
             searchResultEntries = dedupeVersionEntries(index.filter((entry) => {
                 if (!entryMatchesSearchContext(entry)) return false;
                 const text = entry.text || '';
-                return searchTerms.every((term) => text.includes(term));
+                const aliases = entry.aliases || '';
+                return searchTerms.every((term) => text.includes(term) || aliases.includes(term));
             }));
             return searchResultEntries;
         }
@@ -2360,10 +2769,10 @@ def generate_html(total_works):
             currentCategory = STATUS_CATEGORIES[slug]
                 ? createStatusCategory(slug)
                 : (categories.find((category) => category.slug === slug) || categories[0]);
-            document.getElementById('categorySelect').value = currentCategory.slug;
             currentPage = 1;
             activeWorkTypes = [];
             invalidateSearchResults();
+            renderCategorySelect();
             renderWorkTypeButtons();
             await goToPage(1, true);
         }
@@ -2427,7 +2836,16 @@ def generate_html(total_works):
         }
 
         document.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape') closeModal();
+            if (e.key === 'Escape') {
+                closeModal();
+                closeCategoryPicker();
+            }
+        });
+
+        document.addEventListener('click', (e) => {
+            const picker = document.getElementById('categoryPicker');
+            if (!picker || picker.contains(e.target)) return;
+            closeCategoryPicker();
         });
 
         function hydrateCarouselSlide(slide) {

@@ -4,7 +4,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).parent
 PENDING_TRANSLATE_DIR = BASE_DIR / "待翻译"
 AI_DIR = BASE_DIR / "ai"
-FILES_PER_DIR = 1000
+FILES_PER_DIR = 1500
 
 
 def main():
